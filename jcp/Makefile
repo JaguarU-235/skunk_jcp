@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-O2 -Wall
+CFLAGS=-O2 -Wall -std=c99
 
 SRCC=jcp.c
 SRCH=dumpver.h flashstub.h romdump.h turbow.h univbin.h
@@ -8,7 +8,7 @@ OBJS=$(SRCC:.c=.o)
 all: .depend jcp 
 
 jcp: $(OBJS) $(SRCH)
-	gcc -o jcp $(OBJS) -lusb
+	gcc -o jcp $(OBJS) -lusb-1.0
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<

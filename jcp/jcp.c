@@ -75,10 +75,14 @@ Thanks to SebRmv for ideas/fixes in the Skunklib support code
 // hacky trying to guess first.
 //#define JCP_AUTO
 
+// Stop warning about usleep on nonBSD systems
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <libusb-1.0/libusb.h>
 #ifndef __APPLE__
 #include <malloc.h>
 #endif
@@ -86,12 +90,11 @@ Thanks to SebRmv for ideas/fixes in the Skunklib support code
 #include <time.h>
 #ifdef WIN32
 #include <process.h>
-#include "winusb.h"
 #else
 #include <unistd.h>
-#include <usb.h>
 #include <sys/time.h>
 #endif
+
 #include "turbow.h"
 #include "univbin.h"
 #include "romdump.h"
@@ -119,6 +122,10 @@ Thanks to SebRmv for ideas/fixes in the Skunklib support code
 #define	ENMIDEND(_x) (((_x)[0] << 16) + ((_x)[1] << 24) + ((_x)[2]) + ((_x)[3] << 8) )
 #define	HALFLITTLEEND(_x) (((_x)[0]) + ((_x)[1] << 8) )
 
+#define USB_TIMEOUT 5000
+
+
+
 /* data for the SerialBig function */
 char *szNumDat[16] = {
 	" XXX  ",
@@ -138,21 +145,22 @@ char *szNumDat[16] = {
 	" XXXX ",
     "      ",
 };
+
 int nDigits[12][7] = {
-	0,1,1,1,1,1,0,
-	2,3,2,2,2,2,4,
-	12,1,5,6,7,8,4,
-	0,1,5,9,5,1,0,
-	8,10,10,4,11,11,11,
-	4,8,8,0,5,1,0,
-	0,8,8,13,1,1,0,
-	4,5,5,11,2,2,2,
-	0,1,1,0,1,1,0,
-	0,1,1,14,5,5,0,
-	// space, accessed as -1
-	15,15,15,15,15,15,15,
-	// period, accessed as -2
-	15,15,15,15,15,15,6
+        {0, 1, 1, 1, 1, 1, 0},
+        {2, 3, 2, 2, 2, 2, 4},
+        {12, 1, 5, 6, 7, 8, 4},
+        {0, 1, 5, 9, 5, 1, 0},
+        {8, 10, 10, 4, 11, 11, 11},
+        {4, 8, 8, 0, 5, 1, 0},
+        {0, 8, 8, 13, 1, 1, 0},
+        {4, 5, 5, 11, 2, 2, 2},
+        {0, 1, 1, 0, 1, 1, 0},
+        {0, 1, 1, 14, 5, 5, 0},
+        // space, accessed as -1
+        {15, 15, 15, 15, 15, 15, 15},
+        // period, accessed as -2
+        {15, 15, 15, 15, 15, 15, 6}
 };
 
 #ifndef uchar
@@ -191,7 +199,7 @@ DWORD GetTickCount() {
 }
 #endif
 
-usb_dev_handle* findEZ(bool fInstallTurboW, bool fAbortOnFail);
+libusb_device_handle* findEZ(bool fInstallTurboW, bool fAbortOnFail);
 void Reattach();
 void bye(char* msg);
 void SendFile(int flen, uchar *fptr, int curbase, int base);
@@ -216,12 +224,14 @@ bool DetermineFileInfo(bool bMute, uchar *fdata, int *base, int *flen, int *skip
 
 /* globals */
 int nextez = 0x1800;
-usb_dev_handle* udev = NULL;
+libusb_device_handle* udev = NULL;
 uchar *fdata = NULL;
 char g_szFilename[256];
 FILE *fp=NULL;
 bool g_FirstFileSent=false;
 char *g_pszExtShell;
+
+libusb_context* usbctx;
 
 bool g_OptDoFlash=false;
 bool g_OptDoSlowFlash=false;
@@ -453,7 +463,7 @@ int main(int argc, char* argv[])
 	free(fdata);
 	fdata=NULL;
 	if (NULL != udev) {
-		usb_close(udev);
+		libusb_close(udev);
 	}
 
 	return 0;
@@ -530,13 +540,13 @@ void LockBothBuffers() {
 	tmp=0;
 	
 	for (;;) {
-		if (usb_control_msg(udev, 0x40, 0xfe, 4080, 0x1800+0xFEA, (char*)&tmp, 2, 1000) == 2) {
+		if (libusb_control_transfer(udev, 0x40, 0xfe, 4080, 0x1800+0xFEA, (unsigned char*)&tmp, 2, USB_TIMEOUT) == 2) {
 			break;
 		}
 		Reattach();
 	}
 	for (;;) {
-		if (usb_control_msg(udev, 0x40, 0xfe, 4080, 0x2800+0xFEA, (char*)&tmp, 2, 1000) == 2) {
+		if (libusb_control_transfer(udev, 0x40, 0xfe, 4080, 0x2800+0xFEA, (unsigned char*)&tmp, 2, USB_TIMEOUT) == 2) {
 			break;
 		}
 		Reattach();
@@ -549,9 +559,9 @@ bool TestIfBuffersLocked() {
 	volatile short poll=0;
 	bool bRet=false;
 
-	if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x1800+0xFEA, (char*)&poll, 2, 1000) == 2)) {
+	if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x1800+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) == 2)) {
 		if (poll == 0) {
-			if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (char*)&poll, 2, 1000) == 2)) {
+			if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) == 2)) {
 				if (poll == 0) {
 					bRet=true;
 				}
@@ -575,7 +585,7 @@ void WaitForBothBuffers() {
 	// first buffer
 	do {
 		Spin();
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x1800+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x1800+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 			Reattach();
 		} else {
 			Sleep(100);
@@ -586,7 +596,7 @@ void WaitForBothBuffers() {
 	// second buffer
 	do {
 		Spin();
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 			Reattach();
 		} else {
 			Sleep(100);
@@ -611,7 +621,7 @@ void DoReset() {
 
 	LockBothBuffers();		// carries through the reset
 
-	if (usb_control_msg(udev, 0x40, 0xff, 10, 0x304C, (char*)cmd, 10, 1000) != 10) {
+	if (libusb_control_transfer(udev, 0x40, 0xff, 10, 0x304C, (unsigned char*)cmd, 10, USB_TIMEOUT) != 10) {
 		bye("Reset assert failed to send.");
 	}
 
@@ -619,13 +629,13 @@ void DoReset() {
 	Sleep(50);
 
 	cmd[7] = 0;
-	if (usb_control_msg(udev, 0x40, 0xff, 10, 0x304C, (char*)cmd, 10, 1000) != 10) {
+	if (libusb_control_transfer(udev, 0x40, 0xff, 10, 0x304C, (unsigned char*)cmd, 10, USB_TIMEOUT) != 10) {
 		bye("Reset release failed to send.");
 	}
 
 	/* in case it's used elsewhere */
 	if (NULL != udev) {
-		usb_close(udev);
+		libusb_close(udev);
 	}
 	udev=NULL;
 }
@@ -696,7 +706,7 @@ void DoFlash(int nLen) {
 	// first buffer
 	do {
 		Spin();
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x1800+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x1800+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 			Reattach();
 		} else {
 			Sleep(100);
@@ -707,7 +717,7 @@ void DoFlash(int nLen) {
 	// second buffer
 	do {
 		Spin();
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 			Reattach();
 		} else {
 			Sleep(100);
@@ -808,7 +818,7 @@ void DoSerialInfo() {
 	do {
 		Spin();
  
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 			Reattach();
 		}
 //			printf("Polled 0x%08x\n", poll);
@@ -824,7 +834,7 @@ void DoSerialInfo() {
 	if (poll == 0xffff) {
 		// now, get the lower 12 bytes of that buffer - should contain the serial number
 		// If it fails, fall back on the old approach
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x2800, (char*)SerBuf, 12, 1000) == 12)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x2800, (unsigned char*)SerBuf, 12, USB_TIMEOUT) == 12)) {
 			// check for the magic word at the beginning (note the funky byte swapping!)
 			if (0 == memcmp(SerBuf, "\x57\xfa\x0d\xf0", 4)) {
 				// that is what we are looking for! The next 8 bytes are the revision and serial number
@@ -864,7 +874,7 @@ void DoSerialBig() {
 	do {
 		Spin();
  
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x2800+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 			Reattach();
 		}
 //			printf("Polled 0x%08x\n", poll);
@@ -876,7 +886,7 @@ void DoSerialBig() {
 	if (poll == 0xffff) {
 		// now, get the lower 12 bytes of that buffer - should contain the serial number
 		// If it fails, fall back on the old approach
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x2800, (char*)SerBuf, 12, 1000) == 12)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x2800, (unsigned char*)SerBuf, 12, USB_TIMEOUT) == 12)) {
 			// check for the magic word at the beginning (note the funky byte swapping!)
 			if (0 == memcmp(SerBuf, "\x57\xfa\x0d\xf0", 4)) {
 				// that is what we are looking for! The next 8 bytes are the revision and serial number
@@ -957,7 +967,7 @@ void DoBiosUpdate() {
 		// we don't check for the buffer again, because that doesn't work with the rev 1 board
 		// we delayed long enough above that all should be well.
 		// now, get the lower 12 bytes of that buffer - should contain the serial number
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, 0x2800, (char*)SerBuf, 12, 1000) == 12)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, 0x2800, (unsigned char*)SerBuf, 12, USB_TIMEOUT) == 12)) {
 			// check for the magic word at the beginning (note the funky byte swapping!)
 			if (0 == memcmp(SerBuf, "\x57\xfa\x0d\xf0", 4)) {
 				// that is what we are looking for! The next 8 bytes are the revision and serial number
@@ -1102,7 +1112,7 @@ void WriteABlock(uchar *data, int curbase, int start, int len) {
 	do {
 		Spin();
  
-		if ((usb_control_msg(udev, 0xC0, 0xff, 4, nextez+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+		if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, nextez+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 			Reattach();
 		}
 		//printf("Polled 0x%08x\n", poll);
@@ -1127,7 +1137,7 @@ void WriteABlock(uchar *data, int curbase, int start, int len) {
 	}
 
 	// Send off the finished block.
-	if (usb_control_msg(udev, 0x40, 0xfe, 4080, nextez, (char*)block, 4080, 1000) != 4080) {
+	if (libusb_control_transfer(udev, 0x40, 0xfe, 4080, nextez, (unsigned char*)block, 4080, USB_TIMEOUT) != 4080) {
 		Reattach();
 	}
 
@@ -1141,7 +1151,7 @@ void WriteABlock(uchar *data, int curbase, int start, int len) {
 		do {
 			Spin();
 	 
-			if ((usb_control_msg(udev, 0xC0, 0xff, 4, nextez+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+			if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, nextez+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 				Reattach();
 			}
 			//printf("Polled 0x%08x\n", poll);
@@ -1318,59 +1328,77 @@ void bye(char* msg) {
 		printf("* %s\n", msg);
 	}
 	if (NULL != udev) {
-		usb_close(udev);
+		libusb_close(udev);
+		free(udev);
 	}
 	if (NULL != fdata) {
 		free(fdata);
 	}
+	if (NULL != usbctx)
+	    libusb_exit(usbctx);
 	exit(1);
 }
 
 /* Locate the Jaguar on the USB bus, open it, get a handle, and upload the turboW tool */
-usb_dev_handle* findEZ(bool fInstallTurbo, bool fAbortOnFail) {	
-	struct usb_bus *bus;
-	struct usb_device *dev = NULL;
+libusb_device_handle* findEZ(bool fInstallTurbo, bool fAbortOnFail) {
 	int nTriesLeft=3;
-	
-	while (nTriesLeft--) {
-		usb_init();
-		usb_set_debug(0);
+    libusb_device **devices;
+    struct libusb_device_descriptor device;
+    struct libusb_device_handle *udev = NULL;
 
-		usb_find_busses();
-		usb_find_devices();
+    if (libusb_init(&usbctx) != 0)
+    {
+        bye("Unable to initialize LibUSB");
+        exit(1);
+    }
 
-		for (bus = usb_get_busses(); bus; bus = bus->next) {
-			for (dev = bus->devices; dev; dev = dev->next) {
-				if (0x4b4 == dev->descriptor.idVendor && 0x7200 == dev->descriptor.idProduct) {
-					usb_dev_handle* udev = usb_open(dev);
-					if (!udev) {
-						bye("- Found, but can't open, EZ-HOST. In use or not ready? ");
-						udev=NULL;
-						break;		/* should quickly fall out of outer loop too, unless there's another! */
-					}
-					if (fInstallTurbo) {
-						// load turbow from array
-						int ret = usb_control_msg(udev, 0x40, 0xff, 0, 0x304c, (char*)turbow, SIZE_OF_TURBOW, 1000);
+	while (nTriesLeft--)
+	{
+        ssize_t count = libusb_get_device_list(usbctx, &devices);
 
-						if (ret < 1) {
-							printf("Failed to install turbow.bin!\n");
-						} else {
-							if (g_OptVerbose) {
-								printf("Installed turbow.bin: %d scan codes sent\n", ret);
-							}
-						}
-					}
-					return udev;
-				}
-			}
-		}
+        for (int d = 0; d < count; d++)
+        {
+            if (libusb_get_device_descriptor(devices[d], &device) == 0)
+            {
+                if (0x04b4 == device.idVendor && 0x7200 == device.idProduct)
+                {
+                    int e = libusb_open(devices[d], &udev);
+                    if (e != 0)
+                    {
+                        printf("\n%s\n", libusb_error_name(e));
+                        bye("- Found, but can't open, EZ-HOST. In use or not ready?");
+                        libusb_free_device_list(devices, 0);
+                        break;
+                    }
 
-		if (NULL == udev) {
-			if (nTriesLeft > 0) {
-				printf(".. retrying ..\n");
-				Sleep(1000);
-			}
-		}
+                    if (fInstallTurbo) {
+                        // load turbow from array
+                        int ret = libusb_control_transfer(udev, 0x40, 0xff, 0, 0x304c, (unsigned char*)turbow,
+                                SIZE_OF_TURBOW, USB_TIMEOUT);
+
+                        if (ret < 1) {
+                            printf("Failed to install turbow.bin!\n%d, %s\n", ret, libusb_error_name(ret));
+                        } else {
+                            if (g_OptVerbose) {
+                                printf("Installed turbow.bin: %d scan codes sent\n", ret);
+                            }
+                        }
+                    }
+
+                    libusb_free_device_list(devices, 1);
+                    return udev;
+                }
+            }
+        }
+
+        libusb_free_device_list(devices, 1);
+
+        if (NULL == udev) {
+            if (nTriesLeft > 0) {
+                printf(".. retrying ..\n");
+                Sleep(1000);
+            }
+        }
 	}
 
 	if (fAbortOnFail) {
@@ -1394,7 +1422,6 @@ void HandleConsole() {
 	uchar block[4080];
 	unsigned short tmp;
 	int i, len;
-	char *p, *oldp;
 
 	// If the user requested an external console, then we just have to shell out to it here
 	if (NULL != g_pszExtShell) {
@@ -1404,6 +1431,7 @@ void HandleConsole() {
 			bye("External shell failed to launch.");
 		}
 		// if it returns
+		libusb_exit(usbctx);
 		exit(0);
 	}
 
@@ -1434,11 +1462,11 @@ void HandleConsole() {
 	// that way the Jag knows we're up and ready.
 	tmp=0xffff;
 	for (;;) {
-		if (usb_control_msg(udev, 0x40, 0xfe, 4080, 0x1800+0xFEA, (char*)&tmp, 2, 1000) != 2) {
+		if (libusb_control_transfer(udev, 0x40, 0xfe, 4080, 0x1800+0xFEA, (unsigned char*)&tmp, 2, USB_TIMEOUT) != 2) {
 			Reattach();
 			continue;
 		}
-		if (usb_control_msg(udev, 0x40, 0xfe, 4080, 0x2800+0xFEA, (char*)&tmp, 2, 1000) != 2) {
+		if (libusb_control_transfer(udev, 0x40, 0xfe, 4080, 0x2800+0xFEA, (unsigned char*)&tmp, 2, USB_TIMEOUT) != 2) {
 			Reattach();
 			continue;
 		}
@@ -1453,14 +1481,14 @@ void HandleConsole() {
 			nextez = (0x1800 == nextez) ? 0x2800 : 0x1800;
 			// It's actually faster to check this small block and
 			// do two reads than to read the whole block just to test
-			if ((usb_control_msg(udev, 0xC0, 0xff, 4, nextez+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+			if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, nextez+0xFEA, (unsigned char*)&poll, 2, USB_TIMEOUT) != 2)) {
 				Reattach();
 			}
 		} while (-1 == poll);
 
 		// Read in the finished block.
 		for (;;) {
-			if (usb_control_msg(udev, 0xC0, 0xff, 4080, nextez, (char*)block, 4080, 1000) == 4080) {
+			if (libusb_control_transfer(udev, 0xC0, 0xff, 4080, nextez, (unsigned char*)block, 4080, USB_TIMEOUT) == 4080) {
 				break;
 			}
 			Reattach();
@@ -1469,7 +1497,7 @@ void HandleConsole() {
 		// acknowledge the buffer as read to delag the jag
 		tmp=0xffff;
 		for (;;) {
-			if (usb_control_msg(udev, 0x40, 0xfe, 4080, nextez+0xFEA, (char*)&tmp, 2, 1000) == 2) {
+			if (libusb_control_transfer(udev, 0x40, 0xfe, 4080, nextez+0xFEA, (unsigned char*)&tmp, 2, USB_TIMEOUT) == 2) {
 				break;
 			} 
 			Reattach();
@@ -1536,7 +1564,8 @@ void HandleConsole() {
 						// now we must not proceed from this point until the Jaguar
 						// acknowledges that block by clearing its length
 						do {
-							if ((usb_control_msg(udev, 0xC0, 0xff, 4, nextez+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+							if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, nextez+0xFEA, (unsigned char*)&poll, 2,
+							        USB_TIMEOUT) != 2)) {
 								Reattach();
 							}
 							Sleep(500);
@@ -1545,7 +1574,8 @@ void HandleConsole() {
 						// Now clear the buffer back to 0xffff so the Jag can use it again
 						tmp=0xffff;
 						for (;;) {
-							if (usb_control_msg(udev, 0x40, 0xfe, 4080, nextez+0xFEA, (char*)&tmp, 2, 1000) == 2) {
+							if (libusb_control_transfer(udev, 0x40, 0xfe, 4080, nextez+0xFEA, (unsigned char*)&tmp, 2,
+							        USB_TIMEOUT) == 2) {
 								break;
 							}
 							Reattach();
@@ -1655,7 +1685,8 @@ void HandleConsole() {
 					// now we must not proceed from this point until the Jaguar
 					// acknowledges that block by clearing its length
 					do {
-						if ((usb_control_msg(udev, 0xC0, 0xff, 4, nextez+0xFEA, (char*)&poll, 2, 1000) != 2)) {
+						if ((libusb_control_transfer(udev, 0xC0, 0xff, 4, nextez+0xFEA, (unsigned char*)&poll, 2,
+						        USB_TIMEOUT) != 2)) {
 							Reattach();
 						}
 					} while (0 != poll);
@@ -1663,7 +1694,8 @@ void HandleConsole() {
 					// Now clear the buffer back to 0xffff so the Jag can use it again
 					tmp=0xffff;
 					for (;;) {
-						if (usb_control_msg(udev, 0x40, 0xfe, 4080, nextez+0xFEA, (char*)&tmp, 2, 1000) == 2) {
+						if (libusb_control_transfer(udev, 0x40, 0xfe, 4080, nextez+0xFEA, (unsigned char*)&tmp, 2,
+						        USB_TIMEOUT) == 2) {
 							break;
 						}
 						Reattach();
